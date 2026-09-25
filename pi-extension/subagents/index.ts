@@ -39,7 +39,7 @@ import {
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
 } from "./harness/index.ts";
-import { loadModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
+import { parseModelConfig, resolveModelDefault, type ModelConfig } from "./model-config.ts";
 
 import {
   findLastAssistantMessage,
@@ -48,12 +48,14 @@ import {
   seedSubagentSessionFile,
 } from "./session.ts";
 import {
+  type StatusConfig,
   type SubagentStatusState,
+  DEFAULT_STATUS_LINE_LIMIT,
   capStatusLines,
   formatElapsedDuration,
   formatStatusAggregate,
   normalizeStatusName,
-  loadStatusConfig,
+  parseStatusConfig,
 } from "./status.ts";
 import {
   getSubagentActivityFile,
@@ -100,6 +102,170 @@ const RUNTIME_KEY = Symbol.for("pi-subagents/runtime");
     clearInterval(prevStatusInterval);
     (globalThis as any)[STATUS_INTERVAL_KEY] = null;
   }
+}
+
+/** Package root, used only as the legacy config fallback. */
+const PACKAGE_ROOT = join(SUBAGENTS_DIR, "../..");
+const DEFAULT_LEGACY_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
+
+/** File name of the plugin-owned config inside the agent config directory. */
+const SUBAGENT_CONFIG_FILE_NAME = "pi-herdr-subagents.json";
+
+interface OutputConfig {
+  enabled: boolean;
+}
+
+interface SubagentConfig {
+  status: StatusConfig;
+  output: OutputConfig;
+  models: ModelConfig;
+}
+
+const DEFAULT_STATUS: StatusConfig = {
+  enabled: true,
+  lineLimit: DEFAULT_STATUS_LINE_LIMIT,
+};
+const DEFAULT_OUTPUT: OutputConfig = { enabled: true };
+const DEFAULT_MODELS: ModelConfig = { agents: {} };
+
+function createDefaultSubagentConfig(): SubagentConfig {
+  return {
+    status: { ...DEFAULT_STATUS },
+    output: { ...DEFAULT_OUTPUT },
+    models: { agents: { ...DEFAULT_MODELS.agents } },
+  };
+}
+
+export function getDefaultSubagentConfigPath(): string {
+  return join(getAgentConfigDir(), SUBAGENT_CONFIG_FILE_NAME);
+}
+
+function invalidSubagentConfig(source: string, message: string): never {
+  throw new Error(`Invalid subagent config in ${source}: ${message}`);
+}
+
+function requireObject(
+  value: unknown,
+  source: string,
+  fieldName: string,
+): Record<string, unknown> {
+  if (value == null || typeof value !== "object" || Array.isArray(value)) {
+    invalidSubagentConfig(source, `${fieldName} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function rejectUnsupportedKeys(
+  value: Record<string, unknown>,
+  allowedKeys: string[],
+  source: string,
+  fieldName: string,
+): void {
+  const unsupported = Object.keys(value).filter((key) => !allowedKeys.includes(key));
+  if (unsupported.length > 0) {
+    invalidSubagentConfig(source, `${fieldName} has unsupported key(s): ${unsupported.join(", ")}`);
+  }
+}
+
+function parseStatusOverride(raw: unknown, source: string): StatusConfig | undefined {
+  const status = requireObject(raw, source, "status");
+  rejectUnsupportedKeys(status, ["enabled"], source, "status");
+  if (status.enabled === undefined) return undefined;
+  return parseStatusConfig({ status }, source);
+}
+
+function parseOutputOverride(raw: unknown, source: string): OutputConfig | undefined {
+  const output = requireObject(raw, source, "output");
+  rejectUnsupportedKeys(output, ["enabled"], source, "output");
+  if (output.enabled === undefined) return undefined;
+  if (typeof output.enabled !== "boolean") {
+    invalidSubagentConfig(source, "output.enabled must be a boolean");
+  }
+  return { enabled: output.enabled };
+}
+
+function readJsonIfPresent(path: string): unknown | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    const errno = error as NodeJS.ErrnoException;
+    if (errno.code === "ENOENT") return undefined;
+    throw error;
+  }
+
+  try {
+    return JSON.parse(raw.replace(/^\uFEFF/, "")) as unknown;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid JSON in subagent config ${path}: ${detail}`);
+  }
+}
+
+/**
+ * Read a config document whose root holds `status`/`models`/`output`.
+ *
+ * The plugin-owned `pi-herdr-subagents.json` and the legacy package-root
+ * `config.json` share this shape, so a single parser serves both locations.
+ */
+function readConfigRoot(path: string): Record<string, unknown> | undefined {
+  const root = readJsonIfPresent(path);
+  if (root === undefined) return undefined;
+  const config = requireObject(root, path, "root");
+  rejectUnsupportedKeys(config, ["status", "models", "output"], path, "root");
+  return config;
+}
+
+function mergeModelConfigs(base: ModelConfig, override: ModelConfig): ModelConfig {
+  return {
+    default: override.default ?? base.default,
+    agents: { ...base.agents, ...override.agents },
+  };
+}
+
+/**
+ * Load the unified subagent config.
+ *
+ * Precedence is per field: the plugin-owned
+ * `<PI_CODING_AGENT_DIR>/pi-herdr-subagents.json` wins, then the legacy
+ * package-root `config.json`, then built-in defaults. Models merge by agent
+ * name so a new config can override one agent without dropping legacy entries.
+ */
+export function loadSubagentConfig(
+  configPath = getDefaultSubagentConfigPath(),
+  legacyConfigPath = DEFAULT_LEGACY_CONFIG_PATH,
+): SubagentConfig {
+  const plugin = readConfigRoot(configPath);
+  const legacy = readConfigRoot(legacyConfigPath);
+
+  const pluginStatus = plugin?.status !== undefined
+    ? parseStatusOverride(plugin.status, configPath)
+    : undefined;
+  const legacyStatus = legacy?.status !== undefined
+    ? parseStatusOverride(legacy.status, legacyConfigPath)
+    : undefined;
+  const status = pluginStatus ?? legacyStatus ?? { ...DEFAULT_STATUS };
+
+  const pluginOutput = plugin?.output !== undefined
+    ? parseOutputOverride(plugin.output, configPath)
+    : undefined;
+  const legacyOutput = legacy?.output !== undefined
+    ? parseOutputOverride(legacy.output, legacyConfigPath)
+    : undefined;
+  const output = pluginOutput ?? legacyOutput ?? { ...DEFAULT_OUTPUT };
+
+  const pluginModels = plugin?.models !== undefined
+    ? parseModelConfig({ models: plugin.models }, configPath)
+    : undefined;
+  const legacyModels = legacy?.models !== undefined
+    ? parseModelConfig({ models: legacy.models }, legacyConfigPath)
+    : undefined;
+
+  let models: ModelConfig = { agents: { ...DEFAULT_MODELS.agents } };
+  if (legacyModels) models = mergeModelConfigs(models, legacyModels);
+  if (pluginModels) models = mergeModelConfigs(models, pluginModels);
+
+  return { status, output, models };
 }
 
 function buildSubagentRoutingGuidelines(
@@ -346,7 +512,7 @@ function discoverAgentDefinitions(): ListedAgentDefinition[] {
 function buildAvailableAgentCatalog(
   agents: ListedAgentDefinition[],
   limit = 24,
-  config: ModelConfig = modelConfig,
+  config: ModelConfig = subagentConfig.models,
 ): string {
   const sorted = [...agents].sort((a, b) => a.name.localeCompare(b.name));
   const visible = sorted.slice(0, limit);
@@ -514,8 +680,14 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
-const statusConfig = loadStatusConfig();
-const modelConfig = loadModelConfig();
+// Config snapshot for the extension. It is replaced on /reload; already-running
+// subagents keep the model and output setting captured at their launch.
+let subagentConfig: SubagentConfig = createDefaultSubagentConfig();
+
+function reloadSubagentConfig(): SubagentConfig {
+  subagentConfig = loadSubagentConfig();
+  return subagentConfig;
+}
 
 function resolveResultPresentation(
   result: Pick<
@@ -782,7 +954,7 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
     const runtimeTag = agent.runtimePlan
       ? `${agent.runtimePlan.modelId}|${agent.runtimePlan.thinking} · `
       : "";
-    const right = statusConfig.enabled
+    const right = subagentConfig.status.enabled
       ? ` ${runtimeTag}${formatLifecycleWidgetLabel(projection, now).trim()} `
       : agent.cli && agent.cli !== "pi"
         ? ` ${runtimeTag}running… `
@@ -996,7 +1168,7 @@ function handleSubagentInterrupt(
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+  if (!subagentConfig.status.enabled || statusInterval) return;
 
   statusInterval = setInterval(() => {
     if (runningSubagents.size === 0) {
@@ -1043,11 +1215,11 @@ function startStatusRefresh(pi: ExtensionAPI) {
     if (shouldRefreshWidget) updateWidget();
 
     if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
+      const capped = capStatusLines(transitionLines, subagentConfig.status.lineLimit);
       pi.sendMessage(
         {
           customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+          content: formatStatusAggregate(transitionLines, subagentConfig.status.lineLimit),
           display: true,
           details: { lines: capped.visibleLines, overflow: capped.overflow },
         },
@@ -1127,7 +1299,7 @@ async function launchSubagent(
   const runtimePlan = resolveRuntimePlan(
     { model: params.model, thinking: params.thinking },
     {
-      model: resolveModelDefault(params.agent, agentDefs?.model, modelConfig),
+      model: resolveModelDefault(params.agent, agentDefs?.model, subagentConfig.models),
       thinking: agentDefs?.thinking,
     },
     { provider: ctx.model.provider, modelId: ctx.model.id, thinking: parentThinking },
@@ -1430,6 +1602,10 @@ async function watchSubagent(
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   runtime.pi = pi;
+
+  // The config is read at extension init and on /reload. New runs use the new
+  // snapshot; already-running subagents keep their launch-time settings.
+  reloadSubagentConfig();
 
   // Capture the UI context for widget updates and restore presentation for
   // subagents whose watchers survived a reload.

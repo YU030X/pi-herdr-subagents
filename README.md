@@ -98,7 +98,7 @@ Subagent tabs and panes are created without stealing keyboard focus. Launch comm
 | **reviewer**      | Config, then parent   | Reviews code for bugs, security issues, correctness                                      |
 | **visual-tester** | Config, then parent   | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
 
-Bundled agents use model defaults from `config.json` when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. For a named agent, callers should omit `model` and `thinking` so those configured defaults apply. Passing either field explicitly is a one-off override and takes precedence over agent frontmatter.
+Bundled agents use model defaults from the plugin config file when configured; otherwise they inherit the parent model. Thinking defaults still come from agent frontmatter or the parent level. For a named agent, callers should omit `model` and `thinking` so those configured defaults apply. Passing either field explicitly is a one-off override and takes precedence over agent frontmatter.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location. The discovered names, descriptions, and runtime defaults are included in the subagent tool guidance so the orchestrator can select by role instead of treating one agent as a generic default.
 
@@ -171,24 +171,18 @@ A fixed internal watchdog marks a run as `stalled` when pane inspection fails or
 
 #### Configuration
 
-Status display is controlled by `config.json` in the extension directory. Copy `config.json.example` to get started:
-
-```bash
-cp config.json.example config.json
-```
+The extension owns a config file inside the agent config directory: `$PI_CODING_AGENT_DIR/pi-herdr-subagents.json` when `PI_CODING_AGENT_DIR` is set, otherwise `~/.pi/agent/pi-herdr-subagents.json`. The file's root holds the settings directly, so no wrapper namespace is involved.
 
 ```json
 {
-  "status": {
-    "enabled": true
-  },
-  "models": {
-    "agents": {}
-  }
+  "status": { "enabled": true },
+  "models": { "agents": {} }
 }
 ```
 
-The copyable example is model-neutral, so it works without requiring credentials for a specific provider. To configure models, replace the empty section with exact IDs from your authenticated model catalog:
+Every field is optional and merges per field: the plugin config wins, then the legacy package-root `config.json` (`status`/`models`), then built-in defaults (`status` on, no model overrides). Invalid JSON, an unknown root key, or an invalid field fails fast and names the offending file and field. `false` is a valid configured value and is never treated as missing.
+
+To configure models, replace the empty section with exact IDs from your authenticated model catalog. Models merge by agent name, so a new config can override one agent without dropping entries supplied by the legacy file:
 
 ```json
 {
@@ -204,14 +198,18 @@ The copyable example is model-neutral, so it works without requiring credentials
 
 `models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
 
-`config.json` is gitignored so local overrides don't get committed.
+#### Migrating from the legacy package config
+
+The previous package-root `config.json` (`status`/`models` at the top level) still works as a fallback, so installations that used it keep working without edits. It is now held to the same strict shape as the plugin file: only the known sections are accepted at the root, and any other root key fails extension loading with the offending file named. Both locations use the same flat shape, so migrating is a file rename: create `$PI_CODING_AGENT_DIR/pi-herdr-subagents.json` or `~/.pi/agent/pi-herdr-subagents.json` holding the JSON you previously kept in the package config. Fields you leave out continue to fall back to the legacy file and then to the built-in defaults. `config.json.example` shows that shared shape.
+
+Settings stored under a `herdrSubagents` namespace in the shared agent `config.json` are not read from that file. Put those sections into `pi-herdr-subagents.json` instead, with the wrapper removed so they sit at the root.
 
 ---
 
 ## Spawning Subagents
 
 ```typescript
-// Named agent with defaults from agent definition or config.json
+// Named agent with defaults from the agent definition or the plugin config file
 subagent({ name: "Scout", agent: "scout", task: "Analyze the codebase..." });
 
 // Force a full-context fork for this spawn

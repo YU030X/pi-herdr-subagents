@@ -4,5 +4,8 @@
   },
   "models": {
     "agents": {}
+  },
+  "output": {
+    "enabled": true
   }
 }
