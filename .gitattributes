@@ -1,0 +1,3 @@
+# Claude executes the plugin hook through its shebang, so a CRLF checkout
+# (core.autocrlf=true on Windows) would break it. Force LF for shell scripts.
+*.sh text eol=lf
