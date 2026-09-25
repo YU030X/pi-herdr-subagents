@@ -108,6 +108,7 @@ function createMockExtensionApi() {
   const registeredTools: Array<any> = [];
   const registeredCommands: Array<any> = [];
   const registeredMessageRenderers: Array<any> = [];
+  const registeredShortcuts: Array<any> = [];
   const eventHandlers = new Map<string, Array<Function>>();
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
@@ -115,6 +116,7 @@ function createMockExtensionApi() {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
+    registeredShortcuts,
     eventHandlers,
     sentUserMessages,
     sentMessages,
@@ -133,7 +135,9 @@ function createMockExtensionApi() {
       registerMessageRenderer(name: string, renderer: any) {
         registeredMessageRenderers.push({ name, renderer });
       },
-      registerShortcut() {},
+      registerShortcut(shortcut: string, options: any) {
+        registeredShortcuts.push({ shortcut, ...options });
+      },
       sendUserMessage(message: string) {
         sentUserMessages.push(message);
       },
@@ -1551,6 +1555,45 @@ describe("subagent-done.ts", () => {
       } finally {
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", previousAutoExit);
       }
+    });
+  });
+
+  describe("tools widget shortcut", () => {
+    it("binds the widget toggle to Alt+J instead of Ctrl+J", () => {
+      const { api, registeredShortcuts } = createMockExtensionApi();
+      subagentDoneExtension(api);
+
+      assert.deepEqual(
+        registeredShortcuts.map((entry) => entry.shortcut),
+        ["alt+j"],
+      );
+      assert.equal(registeredShortcuts[0].description, "Toggle subagent tools widget");
+      assert.equal(typeof registeredShortcuts[0].handler, "function");
+    });
+
+    it("toggles the widget between collapsed and expanded hint labels", () => {
+      const { api, registeredShortcuts } = createMockExtensionApi();
+      subagentDoneExtension(api);
+      const toggle = registeredShortcuts[0].handler;
+
+      const widgets: string[] = [];
+      const ctx = {
+        ui: {
+          setWidget(_key: string, factory: any) {
+            const box = factory({}, { bg: (_c: string, t: string) => t, bold: (t: string) => t, fg: (_c: string, t: string) => t, muted: (t: string) => t });
+            const rendered = box.render(80).join("\n");
+            widgets.push(rendered);
+          },
+        },
+      };
+
+      toggle(ctx);
+      toggle(ctx);
+
+      assert.ok(widgets.length >= 2, "the shortcut handler must re-render the widget");
+      assert.match(widgets[0], /\(Alt\+J to collapse\)/);
+      assert.match(widgets[widgets.length - 1], /\(Alt\+J to expand\)/);
+      assert.doesNotMatch(widgets.join("\n"), /Ctrl\+J/);
     });
   });
 
