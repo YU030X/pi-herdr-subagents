@@ -171,6 +171,7 @@ function readStatusConfigFile(configPath: string, examplePath: string): { source
   }
 }
 
+/** @deprecated Production loading is unified in config.ts; retained for API compatibility. */
 export function loadStatusConfig(
   configPath = DEFAULT_STATUS_CONFIG_PATH,
   examplePath = STATUS_CONFIG_EXAMPLE_PATH,

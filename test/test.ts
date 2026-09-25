@@ -8,8 +8,6 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
   cleanupSubagentsForShutdown,
-  getDefaultSubagentConfigPath,
-  loadSubagentConfig,
   selectCompletionApi,
   shouldDeliverSubagentCompletion,
   shouldPreserveSubagentsOnShutdown,
@@ -32,6 +30,18 @@ import {
   parseModelConfig,
   resolveModelDefault,
 } from "../pi-extension/subagents/model-config.ts";
+import { loadSubagentConfig, getDefaultSubagentConfigPath } from "../pi-extension/subagents/index.ts";
+import {
+  buildOutputPath,
+  resolveResultPresentation,
+  sanitizeResultName,
+  saveSubagentOutput,
+} from "../pi-extension/subagents/index.ts";
+import {
+  deliverSubagentError,
+  deliverSubagentResult,
+  getSubagentRuntime,
+} from "../pi-extension/subagents/index.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -62,6 +72,7 @@ import {
   lifecycleTransition,
   markCompleted,
   markCompletionDetected,
+  markDelivery,
   markFailed,
   markInterruptRequested,
   observeActivity as observeLifecycleActivity,
@@ -1038,6 +1049,29 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("keeps absolute cwd values instead of joining them onto the parent", () => {
+    const base = { name: "A", task: "T" };
+
+    assert.equal(
+      testApi.resolveSubagentPaths({ ...base, cwd: "packages/app" }, null).effectiveCwd,
+      join(process.cwd(), "packages/app"),
+    );
+    assert.equal(
+      testApi.resolveSubagentPaths({ ...base, cwd: "/srv/app" }, null).effectiveCwd,
+      "/srv/app",
+    );
+
+    if (process.platform === "win32") {
+      for (const cwd of ["D:\\Projects\\demo", "D:/Projects/demo", "\\\\server\\share\\demo"]) {
+        assert.equal(
+          testApi.resolveSubagentPaths({ ...base, cwd }, null).effectiveCwd,
+          cwd,
+          `${cwd} must be treated as absolute`,
+        );
+      }
+    }
+  });
+
   it("resolves auto-exit and interactive behavior for named and bare spawns", () => {
     // Autonomous named agents are not interactive, so the parent gets status pings.
     assert.equal(
@@ -1468,218 +1502,6 @@ describe("subagent discovery", () => {
     assert.match(withOverride, /model anthropic\/test-config-model/);
   });
 });
-describe("subagent configuration", () => {
-  it("resolves the default config path from PI_CODING_AGENT_DIR", () => {
-    const previous = process.env.PI_CODING_AGENT_DIR;
-    const agentDir = join("custom-agent-dir");
-    process.env.PI_CODING_AGENT_DIR = agentDir;
-    try {
-      assert.equal(getDefaultSubagentConfigPath(), join(agentDir, "pi-herdr-subagents.json"));
-    } finally {
-      restoreEnvVar("PI_CODING_AGENT_DIR", previous);
-    }
-  });
-
-  it("ignores settings left in the shared agent config.json", () => {
-    const previous = process.env.PI_CODING_AGENT_DIR;
-    withTempDir((dir) => {
-      process.env.PI_CODING_AGENT_DIR = dir;
-      try {
-        writeFileSync(join(dir, "config.json"), JSON.stringify({
-          herdrSubagents: {
-            status: { enabled: false },
-            models: { agents: { worker: "shared/worker" } },
-          },
-        }));
-
-        assert.deepEqual(loadSubagentConfig(), {
-          status: { enabled: true, lineLimit: 4 },
-          output: { enabled: true },
-          models: { agents: {} },
-        });
-      } finally {
-        restoreEnvVar("PI_CODING_AGENT_DIR", previous);
-      }
-    });
-  });
-
-  it("uses built-in defaults when both config files are missing", () => {
-    withTempDir((dir) => {
-      const config = loadSubagentConfig(
-        join(dir, "missing.json"),
-        join(dir, "legacy-missing.json"),
-      );
-
-      assert.deepEqual(config, {
-        status: { enabled: true, lineLimit: 4 },
-        output: { enabled: true },
-        models: { agents: {} },
-      });
-    });
-  });
-
-  it("prefers the plugin config per field and merges models by agent name", () => {
-    withTempDir((dir) => {
-      const newPath = join(dir, "pi-herdr-subagents.json");
-      const legacyPath = join(dir, "legacy.json");
-      writeFileSync(newPath, JSON.stringify({
-        status: { enabled: false },
-        output: { enabled: false },
-        models: { agents: { worker: "new/worker" } },
-      }));
-      writeFileSync(legacyPath, JSON.stringify({
-        status: { enabled: true },
-        models: {
-          default: "legacy/default",
-          agents: { worker: "legacy/worker", scout: "legacy/scout" },
-        },
-      }));
-
-      const config = loadSubagentConfig(newPath, legacyPath);
-
-      assert.deepEqual(config.status, { enabled: false, lineLimit: 4 });
-      assert.deepEqual(config.output, { enabled: false });
-      assert.deepEqual(config.models, {
-        default: "legacy/default",
-        agents: { worker: "new/worker", scout: "legacy/scout" },
-      });
-    });
-  });
-
-  it("falls back to legacy fields for values the plugin config omits", () => {
-    withTempDir((dir) => {
-      const newPath = join(dir, "pi-herdr-subagents.json");
-      const legacyPath = join(dir, "legacy.json");
-      writeFileSync(newPath, JSON.stringify({
-        output: { enabled: false },
-      }));
-      writeFileSync(legacyPath, JSON.stringify({
-        status: { enabled: false },
-        models: { agents: { worker: "legacy/worker" } },
-      }));
-
-      const config = loadSubagentConfig(newPath, legacyPath);
-
-      assert.equal(config.status.enabled, false);
-      assert.equal(config.output.enabled, false);
-      assert.deepEqual(config.models.agents, { worker: "legacy/worker" });
-    });
-  });
-
-  it("treats false as a valid configured value rather than missing", () => {
-    withTempDir((dir) => {
-      const newPath = join(dir, "pi-herdr-subagents.json");
-      writeFileSync(newPath, JSON.stringify({
-        status: { enabled: false },
-        output: { enabled: false },
-      }));
-
-      const config = loadSubagentConfig(newPath, join(dir, "missing.json"));
-
-      assert.equal(config.status.enabled, false);
-      assert.equal(config.output.enabled, false);
-    });
-  });
-
-  it("falls back per nested field, including legacy output", () => {
-    withTempDir((dir) => {
-      const newPath = join(dir, "pi-herdr-subagents.json");
-      const legacyPath = join(dir, "legacy.json");
-      writeFileSync(newPath, JSON.stringify({
-        status: {},
-        output: {},
-      }));
-      writeFileSync(legacyPath, JSON.stringify({
-        status: { enabled: false },
-        output: { enabled: false },
-      }));
-
-      const config = loadSubagentConfig(newPath, legacyPath);
-
-      assert.equal(config.status.enabled, false);
-      assert.equal(config.output.enabled, false);
-    });
-  });
-
-  it("rejects unknown root keys in the plugin config and in the legacy config", () => {
-    withTempDir((dir) => {
-      const newPath = join(dir, "pi-herdr-subagents.json");
-      writeFileSync(newPath, JSON.stringify({
-        models: { agents: {} },
-        someOtherPlugin: { status: "not-an-object" },
-      }));
-
-      assert.throws(
-        () => loadSubagentConfig(newPath, join(dir, "missing.json")),
-        /pi-herdr-subagents\.json: root has unsupported key\(s\): someOtherPlugin/,
-      );
-
-      const legacyPath = join(dir, "legacy.json");
-      writeFileSync(legacyPath, JSON.stringify({
-        status: { enabled: true },
-        models: { agents: {} },
-        extraSection: 1,
-      }));
-
-      assert.throws(
-        () => loadSubagentConfig(join(dir, "missing.json"), legacyPath),
-        /legacy\.json: root has unsupported key\(s\): extraSection/,
-      );
-    });
-  });
-
-  it("accepts a UTF-8 BOM in user-authored config files", () => {
-    withTempDir((dir) => {
-      const newPath = join(dir, "pi-herdr-subagents.json");
-      writeFileSync(
-        newPath,
-        `\uFEFF${JSON.stringify({ output: { enabled: false } })}`,
-        "utf8",
-      );
-
-      const config = loadSubagentConfig(newPath, join(dir, "missing.json"));
-      assert.equal(config.output.enabled, false);
-    });
-  });
-
-  it("reports invalid JSON with the offending path", () => {
-    withTempDir((dir) => {
-      const newPath = join(dir, "pi-herdr-subagents.json");
-      writeFileSync(newPath, "{\n");
-
-      assert.throws(
-        () => loadSubagentConfig(newPath, join(dir, "missing.json")),
-        /Invalid JSON in subagent config .*pi-herdr-subagents\.json/,
-      );
-    });
-  });
-
-  it("reports invalid plugin fields with the field name", () => {
-    withTempDir((dir) => {
-      const newPath = join(dir, "pi-herdr-subagents.json");
-      const legacyPath = join(dir, "missing.json");
-
-      writeFileSync(newPath, JSON.stringify({ status: { enabled: "yes" } }));
-      assert.throws(
-        () => loadSubagentConfig(newPath, legacyPath),
-        /status\.enabled must be a boolean/,
-      );
-
-      writeFileSync(newPath, JSON.stringify({ output: { enabled: "yes" } }));
-      assert.throws(
-        () => loadSubagentConfig(newPath, legacyPath),
-        /output\.enabled must be a boolean/,
-      );
-
-      writeFileSync(newPath, JSON.stringify({ status: { unknown: 1 } }));
-      assert.throws(
-        () => loadSubagentConfig(newPath, legacyPath),
-        /status has unsupported key/,
-      );
-    });
-  });
-});
-
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {
@@ -3503,5 +3325,432 @@ describe("herdr.ts", () => {
       }), "w1:p1");
       assert.deepEqual(result, { kind: "present", agent: "pi", agentStatus: "unknown" });
     });
+  });
+});
+
+describe("subagent configuration", () => {
+  it("resolves the default config path from PI_CODING_AGENT_DIR", () => {
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    const agentDir = join("custom-agent-dir");
+    process.env.PI_CODING_AGENT_DIR = agentDir;
+    try {
+      assert.equal(getDefaultSubagentConfigPath(), join(agentDir, "pi-herdr-subagents.json"));
+    } finally {
+      restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+    }
+  });
+
+  it("ignores settings left in the shared agent config.json", () => {
+    const previous = process.env.PI_CODING_AGENT_DIR;
+    withTempDir((dir) => {
+      process.env.PI_CODING_AGENT_DIR = dir;
+      try {
+        writeFileSync(join(dir, "config.json"), JSON.stringify({
+          herdrSubagents: {
+            status: { enabled: false },
+            models: { agents: { worker: "shared/worker" } },
+          },
+        }));
+
+        assert.deepEqual(loadSubagentConfig(), {
+          status: { enabled: true, lineLimit: 4 },
+          output: { enabled: true },
+          models: { agents: {} },
+        });
+      } finally {
+        restoreEnvVar("PI_CODING_AGENT_DIR", previous);
+      }
+    });
+  });
+
+  it("uses built-in defaults when both config files are missing", () => {
+    withTempDir((dir) => {
+      const config = loadSubagentConfig(
+        join(dir, "missing.json"),
+        join(dir, "legacy-missing.json"),
+      );
+
+      assert.deepEqual(config, {
+        status: { enabled: true, lineLimit: 4 },
+        output: { enabled: true },
+        models: { agents: {} },
+      });
+    });
+  });
+
+  it("prefers the plugin config per field and merges models by agent name", () => {
+    withTempDir((dir) => {
+      const newPath = join(dir, "pi-herdr-subagents.json");
+      const legacyPath = join(dir, "legacy.json");
+      writeFileSync(newPath, JSON.stringify({
+        status: { enabled: false },
+        output: { enabled: false },
+        models: { agents: { worker: "new/worker" } },
+      }));
+      writeFileSync(legacyPath, JSON.stringify({
+        status: { enabled: true },
+        models: {
+          default: "legacy/default",
+          agents: { worker: "legacy/worker", scout: "legacy/scout" },
+        },
+      }));
+
+      const config = loadSubagentConfig(newPath, legacyPath);
+
+      assert.deepEqual(config.status, { enabled: false, lineLimit: 4 });
+      assert.deepEqual(config.output, { enabled: false });
+      assert.deepEqual(config.models, {
+        default: "legacy/default",
+        agents: { worker: "new/worker", scout: "legacy/scout" },
+      });
+    });
+  });
+
+  it("falls back to legacy fields for values the plugin config omits", () => {
+    withTempDir((dir) => {
+      const newPath = join(dir, "pi-herdr-subagents.json");
+      const legacyPath = join(dir, "legacy.json");
+      writeFileSync(newPath, JSON.stringify({
+        output: { enabled: false },
+      }));
+      writeFileSync(legacyPath, JSON.stringify({
+        status: { enabled: false },
+        models: { agents: { worker: "legacy/worker" } },
+      }));
+
+      const config = loadSubagentConfig(newPath, legacyPath);
+
+      assert.equal(config.status.enabled, false);
+      assert.equal(config.output.enabled, false);
+      assert.deepEqual(config.models.agents, { worker: "legacy/worker" });
+    });
+  });
+
+  it("treats false as a valid configured value rather than missing", () => {
+    withTempDir((dir) => {
+      const newPath = join(dir, "pi-herdr-subagents.json");
+      writeFileSync(newPath, JSON.stringify({
+        status: { enabled: false },
+        output: { enabled: false },
+      }));
+
+      const config = loadSubagentConfig(newPath, join(dir, "missing.json"));
+
+      assert.equal(config.status.enabled, false);
+      assert.equal(config.output.enabled, false);
+    });
+  });
+
+  it("falls back per nested field, including legacy output", () => {
+    withTempDir((dir) => {
+      const newPath = join(dir, "pi-herdr-subagents.json");
+      const legacyPath = join(dir, "legacy.json");
+      writeFileSync(newPath, JSON.stringify({
+        status: {},
+        output: {},
+      }));
+      writeFileSync(legacyPath, JSON.stringify({
+        status: { enabled: false },
+        output: { enabled: false },
+      }));
+
+      const config = loadSubagentConfig(newPath, legacyPath);
+
+      assert.equal(config.status.enabled, false);
+      assert.equal(config.output.enabled, false);
+    });
+  });
+
+  it("rejects unknown root keys in the plugin config and in the legacy config", () => {
+    withTempDir((dir) => {
+      const newPath = join(dir, "pi-herdr-subagents.json");
+      writeFileSync(newPath, JSON.stringify({
+        models: { agents: {} },
+        someOtherPlugin: { status: "not-an-object" },
+      }));
+
+      assert.throws(
+        () => loadSubagentConfig(newPath, join(dir, "missing.json")),
+        /pi-herdr-subagents\.json: root has unsupported key\(s\): someOtherPlugin/,
+      );
+
+      const legacyPath = join(dir, "legacy.json");
+      writeFileSync(legacyPath, JSON.stringify({
+        status: { enabled: true },
+        models: { agents: {} },
+        extraSection: 1,
+      }));
+
+      assert.throws(
+        () => loadSubagentConfig(join(dir, "missing.json"), legacyPath),
+        /legacy\.json: root has unsupported key\(s\): extraSection/,
+      );
+    });
+  });
+
+  it("accepts a UTF-8 BOM in user-authored config files", () => {
+    withTempDir((dir) => {
+      const newPath = join(dir, "pi-herdr-subagents.json");
+      writeFileSync(
+        newPath,
+        `\uFEFF${JSON.stringify({ output: { enabled: false } })}`,
+        "utf8",
+      );
+
+      const config = loadSubagentConfig(newPath, join(dir, "missing.json"));
+      assert.equal(config.output.enabled, false);
+    });
+  });
+
+  it("reports invalid JSON with the offending path", () => {
+    withTempDir((dir) => {
+      const newPath = join(dir, "pi-herdr-subagents.json");
+      writeFileSync(newPath, "{\n");
+
+      assert.throws(
+        () => loadSubagentConfig(newPath, join(dir, "missing.json")),
+        /Invalid JSON in subagent config .*pi-herdr-subagents\.json/,
+      );
+    });
+  });
+
+  it("reports invalid plugin fields with the field name", () => {
+    withTempDir((dir) => {
+      const newPath = join(dir, "pi-herdr-subagents.json");
+      const legacyPath = join(dir, "missing.json");
+
+      writeFileSync(newPath, JSON.stringify({ status: { enabled: "yes" } }));
+      assert.throws(
+        () => loadSubagentConfig(newPath, legacyPath),
+        /status\.enabled must be a boolean/,
+      );
+
+      writeFileSync(newPath, JSON.stringify({ output: { enabled: "yes" } }));
+      assert.throws(
+        () => loadSubagentConfig(newPath, legacyPath),
+        /output\.enabled must be a boolean/,
+      );
+
+      writeFileSync(newPath, JSON.stringify({ status: { unknown: 1 } }));
+      assert.throws(
+        () => loadSubagentConfig(newPath, legacyPath),
+        /status has unsupported key/,
+      );
+    });
+  });
+});
+
+describe("subagent results and output", () => {
+  it("sanitizes result names and keeps run ids distinct", () => {
+    assert.equal(sanitizeResultName("Worker/../../etc"), "worker-etc");
+    assert.equal(sanitizeResultName("  "), "subagent");
+
+    const first = buildOutputPath("/artifacts", "Worker One", "run1");
+    const second = buildOutputPath("/artifacts", "Worker One", "run2");
+    assert.notEqual(first, second);
+    assert.match(first.replace(/\\/g, "/"), /\/output\/worker-one-run1_output\.md$/);
+  });
+
+  it("writes the summary as UTF-8 and never overwrites another run", () => {
+    withTempDir((dir) => {
+      const saved = saveSubagentOutput({
+        artifactDir: dir,
+        name: "Worker/One",
+        runId: "run1",
+        summary: "# Result\n\nDone",
+      });
+
+      assert.ok(saved.outputPath);
+      assert.equal(readFileSync(saved.outputPath!, "utf8"), "# Result\n\nDone");
+
+      const other = saveSubagentOutput({
+        artifactDir: dir,
+        name: "Worker/One",
+        runId: "run2",
+        summary: "second",
+      });
+      assert.ok(other.outputPath);
+      assert.notEqual(other.outputPath, saved.outputPath);
+
+      const duplicate = saveSubagentOutput({
+        artifactDir: dir,
+        name: "Worker/One",
+        runId: "run1",
+        summary: "must not overwrite",
+      });
+      assert.equal(duplicate.outputPath, undefined);
+      assert.match(duplicate.warning ?? "", /Failed to save subagent output/);
+      assert.equal(readFileSync(saved.outputPath!, "utf8"), "# Result\n\nDone");
+    });
+  });
+
+  it("reports a warning instead of throwing when output cannot be written", () => {
+    withTempDir((dir) => {
+      const filePath = join(dir, "not-a-directory");
+      writeFileSync(filePath, "x");
+
+      const saved = saveSubagentOutput({
+        artifactDir: filePath,
+        name: "Worker",
+        runId: "run1",
+        summary: "body",
+      });
+
+      assert.equal(saved.outputPath, undefined);
+      assert.match(saved.warning ?? "", /Failed to save subagent output/);
+    });
+  });
+
+  it("attaches output, warning, and mismatch while keeping Session last", () => {
+    const result = {
+      exitCode: 0,
+      elapsed: 5,
+      summary: "body",
+      sessionFile: "/tmp/subagent.jsonl",
+    };
+
+    const plain = resolveResultPresentation(result, "Worker");
+    assert.doesNotMatch(plain, /Output:|Warning:|Runtime warning:/);
+
+    const attached = resolveResultPresentation(result, "Worker", {
+      runtimeMismatch: "model changed",
+      warning: "disk full",
+      outputPath: "/tmp/out.md",
+    });
+    assert.match(attached, /Runtime warning: model changed/);
+    assert.match(attached, /Warning: disk full/);
+    assert.match(attached, /Output: \/tmp\/out\.md/);
+    assert.match(attached, /\n\nSession: \/tmp\/subagent\.jsonl\nResume: pi --session \/tmp\/subagent\.jsonl$/);
+  });
+
+  function makeRunningForDelivery(overrides: Record<string, unknown> = {}) {
+    return {
+      id: "run",
+      name: "Worker",
+      task: "task",
+      surface: "s1",
+      startTime: 0,
+      sessionFile: "s.jsonl",
+      artifactDir: "/tmp",
+      entryCountBefore: 0,
+      outputEnabled: false,
+      interactive: false,
+      lifecycle: createLifecycle(0),
+      ...overrides,
+    } as any;
+  }
+
+  it("writes output through the shared delivery path and attaches its path", () => {
+    withTempDir((dir) => {
+      const runtime = getSubagentRuntime();
+      runtime.latestCtx = undefined;
+      runtime.runningSubagents.clear();
+      const running = makeRunningForDelivery({ id: "run1", artifactDir: dir, outputEnabled: true });
+      runtime.runningSubagents.set(running.id, running);
+      const sent: any[] = [];
+      const api = { sendMessage(message: any) { sent.push(message); } };
+      runtime.pi = api as any;
+
+      try {
+        deliverSubagentResult(api as any, running, {
+          name: "Worker",
+          task: "task",
+          summary: "Final body",
+          exitCode: 0,
+          elapsed: 3,
+        });
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0].customType, "subagent_result");
+        assert.match(sent[0].content, /Output: /);
+        assert.equal(readFileSync(sent[0].details.outputFile, "utf8"), "Final body");
+        assert.equal(runtime.runningSubagents.has("run1"), false);
+      } finally {
+        runtime.runningSubagents.clear();
+      }
+    });
+  });
+
+  it("saves unexpected watcher failures through the same gated delivery path", () => {
+    withTempDir((dir) => {
+      const runtime = getSubagentRuntime();
+      runtime.latestCtx = undefined;
+      runtime.runningSubagents.clear();
+      const running = makeRunningForDelivery({
+        id: "run-error",
+        artifactDir: dir,
+        outputEnabled: true,
+        startTime: Date.now(),
+      });
+      runtime.runningSubagents.set(running.id, running);
+      const sent: any[] = [];
+      const api = { sendMessage(message: any) { sent.push(message); } };
+      runtime.pi = api as any;
+
+      try {
+        deliverSubagentError(api as any, running, new Error("watcher exploded"));
+
+        assert.equal(sent.length, 1);
+        assert.equal(sent[0].customType, "subagent_result");
+        assert.equal(sent[0].details.exitCode, 1);
+        assert.equal(
+          readFileSync(sent[0].details.outputFile, "utf8"),
+          "Subagent error: watcher exploded",
+        );
+      } finally {
+        runtime.runningSubagents.clear();
+      }
+    });
+  });
+
+  it("skips output when disabled and suppresses an already-delivered run", () => {
+    withTempDir((dir) => {
+      const runtime = getSubagentRuntime();
+      runtime.latestCtx = undefined;
+      runtime.runningSubagents.clear();
+      const sent: any[] = [];
+      const api = { sendMessage(message: any) { sent.push(message); } };
+      runtime.pi = api as any;
+
+      try {
+        const disabled = makeRunningForDelivery({ id: "run2", artifactDir: dir, outputEnabled: false });
+        runtime.runningSubagents.set(disabled.id, disabled);
+        deliverSubagentResult(api as any, disabled, {
+          name: "Worker",
+          task: "task",
+          summary: "body",
+          exitCode: 0,
+          elapsed: 1,
+        });
+
+        assert.equal(sent.length, 1);
+        assert.doesNotMatch(sent[0].content, /Output:/);
+        assert.equal(existsSync(join(dir, "output")), false);
+
+        const delivered = makeRunningForDelivery({ id: "run3", artifactDir: dir, outputEnabled: true });
+        delivered.lifecycle = markDelivery(delivered.lifecycle, "delivered");
+        runtime.runningSubagents.set(delivered.id, delivered);
+        deliverSubagentResult(api as any, delivered, {
+          name: "Worker",
+          task: "task",
+          summary: "body",
+          exitCode: 0,
+          elapsed: 1,
+        });
+
+        assert.equal(sent.length, 1);
+      } finally {
+        runtime.runningSubagents.clear();
+      }
+    });
+  });
+});
+
+describe("subagent runtime module", () => {
+  it("keeps one globalThis-backed registry across module entry points", () => {
+    const runtime = getSubagentRuntime();
+
+    assert.equal(runtime.runningSubagents, (subagentsModule as any).__test__.runningSubagents);
+    assert.equal((globalThis as any)[Symbol.for("pi-subagents/runtime")], runtime);
   });
 });

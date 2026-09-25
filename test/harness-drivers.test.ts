@@ -16,6 +16,7 @@ import {
 } from "../pi-extension/subagents/harness/index.ts";
 import type { ResolvedRuntimePlan } from "../pi-extension/subagents/runtime-routing.ts";
 import type { SubagentResultContext } from "../pi-extension/subagents/harness/types.ts";
+import { getSubagentActivityFile } from "../pi-extension/subagents/activity.ts";
 
 function createMockLaunchContext(overrides?: Partial<SubagentLaunchContext>): SubagentLaunchContext {
   const runtimePlan: ResolvedRuntimePlan = {
@@ -135,6 +136,24 @@ describe("Pi Harness Driver", () => {
     assert.ok(built.command.includes("--model 'anthropic/claude-sonnet-4-5'"));
     assert.ok(built.command.includes("--thinking 'high'"));
     assert.ok(built.command.includes("echo '__SUBAGENT_DONE_'$?'__'"));
+  });
+
+  it("scopes task and system-prompt artifacts to the run id", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-artifacts-"));
+    try {
+      const built = driver.buildCommand(createMockLaunchContext({
+        artifactDir: dir,
+        taskDelivery: "artifact",
+        identity: "You are a reviewer.",
+        identityInSystemPrompt: true,
+        systemPromptMode: "append",
+      }));
+
+      assert.match(built.command.replace(/\\/g, "/"), /context\/worker-\d{4}-\d{2}-\d{2}T[\d-]+-abc12345\.md/);
+      assert.match(built.command.replace(/\\/g, "/"), /context\/worker-sysprompt-\d{4}-\d{2}-\d{2}T[\d-]+-abc12345\.md/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -330,6 +349,19 @@ describe("Claude Harness Driver", () => {
     assert.ok(result);
     assert.equal(result.summary, "Claude Code exited with code 1");
   });
+
+  it("keeps the completion sentinel inside the artifact directory", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-sentinel-"));
+    try {
+      const built = driver.buildCommand(createMockLaunchContext({ artifactDir: dir }));
+      const expected = join(dir, "pi-claude-abc12345-done").replace(/\\/g, "/");
+
+      assert.equal(built.sentinelFile, expected);
+      assert.ok(built.command.includes(`PI_CLAUDE_SENTINEL='${expected}'`));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("Generic Harness Driver & Templates", () => {
@@ -389,5 +421,97 @@ describe("Generic Harness Driver & Templates", () => {
     }));
     assert.ok(result);
     assert.equal(result.summary, "aider exited with code 1");
+  });
+});
+
+describe("Pi result extraction", () => {
+  const driver = new PiHarnessDriver();
+
+  it("points the child activity file at the path the parent reads", () => {
+    const ctx = createMockLaunchContext({
+      params: { id: "abc12345", name: "worker", task: "do it" },
+    });
+    const built = driver.buildCommand(ctx);
+    const expected = getSubagentActivityFile(ctx.artifactDir, "abc12345");
+
+    assert.equal(built.cli, "pi");
+    assert.ok(
+      built.command.includes(`PI_SUBAGENT_ACTIVITY_FILE='${expected}'`),
+      `expected canonical activity path in: ${built.command}`,
+    );
+  });
+
+  it("extracts only entries after the resume offset", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-extract-offset-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const entries = [
+      { type: "message", id: "u1", message: { role: "user", content: [{ type: "text", text: "old" }] } },
+      { type: "message", id: "a1", message: { role: "assistant", content: [{ type: "text", text: "old answer" }] } },
+      { type: "message", id: "a2", message: { role: "assistant", content: [{ type: "text", text: "new answer" }] } },
+    ];
+    writeFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+
+    try {
+      const result = await driver.extractResult({
+        ...createMockResultContext(),
+        entryCountBefore: 2,
+        running: {
+          id: "1",
+          name: "test",
+          task: "task",
+          surface: "s1",
+          startTime: Date.now(),
+          sessionFile,
+          interactive: false,
+        },
+      });
+
+      assert.ok(result);
+      assert.equal(result.summary, "new answer");
+      assert.equal(result.sessionFile, sessionFile);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("records observed runtime and clamps a model mismatch", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-extract-model-"));
+    const sessionFile = join(dir, "session.jsonl");
+    const entries = [
+      { type: "model_change", id: "mc1", provider: "anthropic", modelId: "other-model" },
+      { type: "message", id: "a1", message: { role: "assistant", content: [{ type: "text", text: "done" }] } },
+    ];
+    writeFileSync(sessionFile, entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n");
+    const running = {
+      id: "1",
+      name: "test",
+      task: "task",
+      surface: "s1",
+      startTime: Date.now(),
+      sessionFile,
+      interactive: false,
+      runtimePlan: {
+        provider: "anthropic",
+        modelId: "wanted-model",
+        model: "anthropic/wanted-model",
+        thinking: "medium",
+        modelSource: "request",
+        thinkingSource: "request",
+      },
+    };
+
+    try {
+      const result = await driver.extractResult({
+        ...createMockResultContext(),
+        running,
+      });
+
+      assert.ok(result);
+      assert.equal(result.summary, "done");
+      assert.equal(running.runtimePlan.observed?.model, "anthropic/other-model");
+      assert.match(running.runtimePlan.runtimeMismatch ?? "", /but child reported anthropic\/other-model/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

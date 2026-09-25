@@ -4,8 +4,13 @@ import type {
   HarnessDriver,
   SubagentLaunchContext,
   BuiltHarnessCommand,
+  SubagentResultContext,
+  HarnessResult,
 } from "../types.ts";
 import type { ResolvedRuntimePlan } from "../../runtime-routing.ts";
+import { isThinkingLevel } from "../../runtime-routing.ts";
+import { findLastAssistantMessage, findObservedSessionRuntime, getNewEntries } from "../../session.ts";
+import { getSubagentActivityFile } from "../../activity.ts";
 
 const SUBAGENT_CONTROL_TOOLS = ["caller_ping", "subagent_done"] as const;
 
@@ -102,7 +107,10 @@ export class PiHarnessDriver implements HarnessDriver {
         .replace(/\s+/g, "-")
         .replace(/-+/g, "-")
         .replace(/^-|-$/g, "");
-      const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
+      const syspromptPath = join(
+        artifactDir,
+        `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}-${params.id}.md`,
+      );
       mkdirSync(dirname(syspromptPath), { recursive: true });
       writeFileSync(syspromptPath, identity, "utf8");
       parts.push(flag, shellQuote(syspromptPath));
@@ -133,7 +141,7 @@ export class PiHarnessDriver implements HarnessDriver {
     }
     envParts.push(`PI_SUBAGENT_SESSION=${shellQuote(subagentSessionFile)}`);
     envParts.push(`PI_SUBAGENT_ID=${shellQuote(params.id)}`);
-    const activityFile = join(artifactDir, `subagent-activity-${params.id}.json`);
+    const activityFile = getSubagentActivityFile(artifactDir, params.id);
     envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellQuote(activityFile)}`);
     envParts.push(`PI_SUBAGENT_SURFACE=${shellQuote(surface)}`);
 
@@ -152,7 +160,9 @@ export class PiHarnessDriver implements HarnessDriver {
         .replace(/\s+/g, "-")
         .replace(/-+/g, "-")
         .replace(/^-|-$/g, "");
-      const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
+      // The run id keeps two same-named spawns in the same second from
+      // overwriting each other's task artifact.
+      const artifactName = `context/${safeName || "subagent"}-${timestamp}-${params.id}.md`;
       const artifactPath = join(artifactDir, artifactName);
       mkdirSync(dirname(artifactPath), { recursive: true });
       writeFileSync(artifactPath, fullTask, "utf8");
@@ -185,5 +195,48 @@ export class PiHarnessDriver implements HarnessDriver {
         `# Runtime: ${runtimePlan.model} (thinking: ${runtimePlan.thinking})`,
       ],
     };
+  }
+
+  /**
+   * Extract the final assistant message (and observed runtime) from the Pi
+   * session JSONL. `entryCountBefore` keeps resume runs from re-reporting
+   * replies that already existed before the resume.
+   */
+  async extractResult(context: SubagentResultContext): Promise<HarnessResult | null> {
+    const { running, completionResult } = context;
+    const sessionFile = running.sessionFile;
+    if (!sessionFile || !existsSync(sessionFile)) return null;
+
+    const entries = getNewEntries(sessionFile, context.entryCountBefore ?? 0);
+
+    const observed = findObservedSessionRuntime(entries);
+    if (running.runtimePlan && observed.provider && observed.modelId) {
+      const observedModel = `${observed.provider}/${observed.modelId}`;
+      const observedThinking = observed.thinking && isThinkingLevel(observed.thinking)
+        ? observed.thinking
+        : undefined;
+      const mismatch = observedModel !== running.runtimePlan.model
+        ? `Resolved model ${running.runtimePlan.model} but child reported ${observedModel}`
+        : undefined;
+      running.runtimePlan = {
+        ...running.runtimePlan,
+        ...(observedThinking ? { thinking: observedThinking } : {}),
+        observed: {
+          model: observedModel,
+          ...(observedThinking ? { thinking: observedThinking } : {}),
+        },
+        ...(mismatch ? { runtimeMismatch: mismatch } : {}),
+      };
+    }
+
+    const summary =
+      findLastAssistantMessage(entries) ??
+      (completionResult.errorMessage
+        ? `Subagent error: ${completionResult.errorMessage}`
+        : completionResult.exitCode !== 0
+          ? `Sub-agent exited with code ${completionResult.exitCode}`
+          : "Sub-agent exited without output");
+
+    return { summary, sessionFile };
   }
 }

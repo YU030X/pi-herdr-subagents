@@ -87,11 +87,15 @@ export interface SubagentResultContext {
   readPane: (surface: string, lines?: number) => string;
   closePane: (surface: string) => void;
   artifactDir: string;
+  /** Session JSONL entries already present before this run; Pi reads from here. */
+  entryCountBefore?: number;
 }
 
 export interface HarnessResult {
   summary: string;
   sessionId?: string;
+  /** Session file the summary was extracted from, when the driver owns one. */
+  sessionFile?: string;
   details?: Record<string, unknown>;
 }
 

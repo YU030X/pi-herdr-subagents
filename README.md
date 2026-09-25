@@ -176,11 +176,12 @@ The extension owns a config file inside the agent config directory: `$PI_CODING_
 ```json
 {
   "status": { "enabled": true },
-  "models": { "agents": {} }
+  "models": { "agents": {} },
+  "output": { "enabled": true }
 }
 ```
 
-Every field is optional and merges per field: the plugin config wins, then the legacy package-root `config.json` (`status`/`models`), then built-in defaults (`status` on, no model overrides). Invalid JSON, an unknown root key, or an invalid field fails fast and names the offending file and field. `false` is a valid configured value and is never treated as missing.
+Every field is optional and merges per field: the plugin config wins, then the legacy package-root `config.json` (`status`/`models`, plus `output` when present), then built-in defaults (`status` on, no model overrides, `output` on). Invalid JSON, an unknown root key, or an invalid field fails fast and names the offending file and field. `false` is a valid configured value and is never treated as missing.
 
 To configure models, replace the empty section with exact IDs from your authenticated model catalog. Models merge by agent name, so a new config can override one agent without dropping entries supplied by the legacy file:
 
@@ -198,9 +199,11 @@ To configure models, replace the empty section with exact IDs from your authenti
 
 `models.default` sets the model for subagents that do not specify a model. `models.agents` sets per-agent defaults, keyed by the agent name passed to `subagent({ agent: ... })`. Explicit `model` tool arguments take precedence, followed by agent frontmatter, per-agent config, the global default, and finally the parent model. Model values must be exact authenticated `provider/model-id` references.
 
+`output.enabled` controls whether each ordinary completed run also writes its extracted result to `<artifactDir>/output/<safe-name>-<runId>_output.md` as UTF-8. The message delivered to the parent always contains the same result text; the file is an on-disk copy. Ping and turn-interrupt paths never write output. A write failure is reported as a warning on the delivered result and never changes success/failure or blocks delivery.
+
 #### Migrating from the legacy package config
 
-The previous package-root `config.json` (`status`/`models` at the top level) still works as a fallback, so installations that used it keep working without edits. It is now held to the same strict shape as the plugin file: only the known sections are accepted at the root, and any other root key fails extension loading with the offending file named. Both locations use the same flat shape, so migrating is a file rename: create `$PI_CODING_AGENT_DIR/pi-herdr-subagents.json` or `~/.pi/agent/pi-herdr-subagents.json` holding the JSON you previously kept in the package config. Fields you leave out continue to fall back to the legacy file and then to the built-in defaults. `config.json.example` shows that shared shape.
+The previous package-root `config.json` (`status`/`models` at the top level, with optional `output`) still works as a fallback, so installations that used it keep working without edits. It is now held to the same strict shape as the plugin file: only `status`, `models`, and `output` are accepted at the root, and any other root key fails extension loading with the offending file named. Both locations use the same flat shape, so migrating is a file rename: create `$PI_CODING_AGENT_DIR/pi-herdr-subagents.json` or `~/.pi/agent/pi-herdr-subagents.json` holding the JSON you previously kept in the package config. Fields you leave out continue to fall back to the legacy file and then to the built-in defaults. `config.json.example` shows that shared shape.
 
 Settings stored under a `herdrSubagents` namespace in the shared agent `config.json` are not read from that file. Put those sections into `pi-herdr-subagents.json` instead, with the wrapper removed so they sit at the root.
 
@@ -411,7 +414,7 @@ auto-exit: true
 
 Controls whether status transitions (`stalled`, `recovered`) wake the parent session with a steer message.
 
-**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs (e.g. `/iterate` with `fork: true`) are treated as interactive.
+**Default:** the inverse of `auto-exit`. Autonomous agents (`auto-exit: true`) are non-interactive and ping the parent on stall/recovery; agents without `auto-exit` are interactive and stay quiet. Bare spawns with no agent defs are autonomous by default (`interactive: false`), so they receive stall pings; interactive workflows such as `/iterate` pass `interactive: true` explicitly.
 
 **Why it exists:** Interactive agents can run for minutes or hours while the user thinks, types, and reads in the subagent's pane. Child snapshots still update the widget, but stalled/recovered supervision messages rarely need to wake the parent for user-driven sessions. Skipping the steer keeps the parent quiet until the child actually finishes.
 

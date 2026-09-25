@@ -1,5 +1,6 @@
 import { copyFileSync, existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { homedir } from "node:os";
+import { basename, dirname, join } from "node:path";
 import type {
   HarnessDriver,
   SubagentLaunchContext,
@@ -10,10 +11,14 @@ import type {
 import type { ResolvedRuntimePlan, ThinkingLevel } from "../../runtime-routing.ts";
 import { extractPaneSummary } from "../pane-summary.ts";
 
-const CLAUDE_SESSIONS_DIR = join(
-  process.env.HOME ?? "/tmp",
-  ".pi", "agent", "sessions", "claude-code",
-);
+/**
+ * Resolve the pi agent config directory, respecting PI_CODING_AGENT_DIR.
+ * Kept local on purpose: importing the extension entry module from a harness
+ * driver would create an import cycle.
+ */
+function getAgentConfigDir(): string {
+  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
 
 function copyClaudeSession(sentinelFile: string): string | null {
   try {
@@ -21,10 +26,13 @@ function copyClaudeSession(sentinelFile: string): string | null {
     if (!existsSync(transcriptFile)) return null;
     const transcriptPath = readFileSync(transcriptFile, "utf-8").trim();
     if (!transcriptPath || !existsSync(transcriptPath)) return null;
-    mkdirSync(CLAUDE_SESSIONS_DIR, { recursive: true });
-    const filename = transcriptPath.split("/").pop() ?? `claude-${Date.now()}.jsonl`;
-    const dest = join(CLAUDE_SESSIONS_DIR, filename);
-    copyFileSync(transcriptPath, dest);
+    // Resolve the destination from the agent config dir. $HOME with a POSIX
+    // "/tmp" fallback writes to the current drive root on Windows, and
+    // splitting on "/" never finds a basename in a Windows path.
+    const sessionsDir = join(getAgentConfigDir(), "sessions", "claude-code");
+    mkdirSync(sessionsDir, { recursive: true });
+    const filename = basename(transcriptPath) || `claude-${Date.now()}.jsonl`;
+    copyFileSync(transcriptPath, join(sessionsDir, filename));
     return filename;
   } catch {
     return null;
@@ -57,10 +65,15 @@ export class ClaudeHarnessDriver implements HarnessDriver {
       subagentsDir,
       effectiveCwd,
       surface,
+      artifactDir,
       shellQuote,
     } = context;
 
-    const sentinelFile = `/tmp/pi-claude-${params.id}-done`;
+    // Keep the sentinel beside the run's artifacts and use forward slashes: the
+    // child is Git Bash, where a literal "/tmp" resolves to the Windows temp
+    // directory, while Node resolves the same string to the current drive root.
+    const sentinelFile = join(artifactDir, `pi-claude-${params.id}-done`).replace(/\\/g, "/");
+    mkdirSync(dirname(sentinelFile), { recursive: true });
     const pluginDir = join(subagentsDir, "plugin");
 
     const cmdParts: string[] = [];

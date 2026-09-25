@@ -352,6 +352,16 @@ export function uniqueId(): string {
 }
 
 /**
+ * Return a temp path understood identically by Node and the bash shell running
+ * inside Herdr. On Windows, `/tmp` points at the MSYS temp directory while
+ * Node resolves it from the current drive, so use the OS temp directory with
+ * forward slashes instead.
+ */
+export function getTempFilePath(fileName: string): string {
+  return join(tmpdir(), fileName).replace(/\\/g, "/");
+}
+
+/**
  * Register a temp file for cleanup.
  */
 export function trackTempFile(env: TestEnv, path: string): void {

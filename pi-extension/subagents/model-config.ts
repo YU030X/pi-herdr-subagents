@@ -74,6 +74,7 @@ export function resolveModelDefault(
   return config.default;
 }
 
+/** @deprecated Production loading is unified in config.ts; retained for API compatibility. */
 export function loadModelConfig(configPath = DEFAULT_MODEL_CONFIG_PATH): ModelConfig {
   let raw: string;
   try {
